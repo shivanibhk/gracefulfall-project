@@ -1,0 +1,3 @@
+# GracefulFall: Adaptive Pipeline Selection for Wearable Fall Detection with Cardiac Context
+
+Can runtime controller keep a wearable fall detector useful when sensors or resources degrade? We will build a pipeline (IMU, PPG heart rate, and microphone on an Arduino Nano BLE Sense Rev2, plys a phone/laptop) that classifies falls as mechanical or possibly cardiac. We will evaluate how pipeline selection under sensor loss, BLE/network slowdown, and compute limits compares to static baselines against a real-time alert deadline.

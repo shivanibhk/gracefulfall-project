@@ -3,10 +3,12 @@
 #include <Arduino_BMI270_BMM150.h> // Correct library for Rev 2
 
 BLEService sensorService("180C"); 
-BLEStringCharacteristic dataCharacteristic("2A56", BLERead | BLENotify, 30);
+// INCREASED buffer size from 30 to 100 bytes so the larger payload doesn't get cut off
+BLEStringCharacteristic dataCharacteristic("2A56", BLERead | BLENotify, 100);
 
 // Declare variables globally to avoid reallocation
 float x, y, z;
+float gx, gy, gz; // Added for Gyroscope
 
 void setup() {
   Serial.begin(9600);
@@ -30,11 +32,24 @@ void loop() {
   BLEDevice central = BLE.central();
   if (central) {
     while (central.connected()) {
-      if (IMU.accelerationAvailable()) {
-        IMU.readAcceleration(x, y, z); // Updates the global variables
-        String payload = String(millis()) + "," + String(x, 2) + "," + String(y, 2) + "," + String(z, 2) + ",99";
+      // Check if BOTH acceleration and gyroscope data are ready
+      if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+        
+        IMU.readAcceleration(x, y, z);
+        IMU.readGyroscope(gx, gy, gz); 
+        
+        // Construct the new 6-channel payload
+        // Format: Timestamp, Accel_X, Accel_Y, Accel_Z, Gyro_X, Gyro_Y, Gyro_Z
+        String payload = String(millis()) + "," + 
+                         String(x, 2) + "," + String(y, 2) + "," + String(z, 2) + "," +
+                         String(gx, 2) + "," + String(gy, 2) + "," + String(gz, 2);
+                         
         dataCharacteristic.writeValue(payload);
-        delay(20); 
+        
+        // I reduced this from 20 to 15. The Arduino takes a few milliseconds to build 
+        // the string and send the Bluetooth packet. A delay of 15ms + overhead 
+        // will get you much closer to the target 50Hz (20ms total) loop speed!
+        delay(15); 
       }
     }
   }

@@ -48,15 +48,16 @@ class FallDetectorNN(nn.Module):
         return x
 
 # loop that adjusts the model weights
-def train_model(model, train_loader, num_epochs=10, learning_rate=0.001):
+def train_model(model, train_loader, test_loader, num_epochs=10, learning_rate=0.001):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     print("Starting training...")
     for epoch in range(num_epochs):
+        # --- TRAINING PHASE ---
         model.train() # Set model to training mode
         total_loss = 0
-        correct = 0
+        train_correct = 0
         
         for batch_X, batch_y in train_loader:
             optimizer.zero_grad() # Clear old gradients
@@ -73,24 +74,55 @@ def train_model(model, train_loader, num_epochs=10, learning_rate=0.001):
             
             total_loss += loss.item()
             predictions = torch.argmax(outputs, dim=1)
-            correct += (predictions == batch_y).sum().item()
+            train_correct += (predictions == batch_y).sum().item()
             
-        accuracy = correct / len(train_loader.dataset)
-        print(f"Epoch {epoch+1}/{num_epochs} | Loss: {total_loss:.4f} | Accuracy: {accuracy*100:.2f}%")
+        train_accuracy = train_correct / len(train_loader.dataset)
+            
+        # --- TESTING PHASE (No learning allowed) ---
+        model.eval()
+        test_correct = 0
+        with torch.no_grad():
+            for test_X, test_y in test_loader:
+                test_outputs = model(test_X)
+                test_predictions = torch.argmax(test_outputs, dim=1)
+                test_correct += (test_predictions == test_y).sum().item()
+                
+        test_accuracy = test_correct / len(test_loader.dataset)
+        
+        print(f"Epoch {epoch+1:02d}/{num_epochs} | Train Loss: {total_loss:.2f} | Train Acc: {train_accuracy*100:.2f}% | Test Acc: {test_accuracy*100:.2f}%")
     
-    # Save the trained weights to a file so Pipeline A can load them later!
     torch.save(model.state_dict(), "sisfall_heavy_model.pth")
     print("Model saved to sisfall_heavy_model.pth")
 
+def manual_train_test_split(X, y, test_size=0.2, random_state=42):
+    """A numpy-based replacement for sklearn's train_test_split."""
+    np.random.seed(random_state)
+    indices = np.arange(len(X))
+    np.random.shuffle(indices)
+    
+    split_idx = int(len(X) * (1 - test_size))
+    train_indices = indices[:split_idx]
+    test_indices = indices[split_idx:]
+    
+    return X[train_indices], X[test_indices], y[train_indices], y[test_indices]
+
 # 1. Run the parser on your downloaded folder
+# 1. Run the parser
 print("Parsing SisFall raw files. This might take a minute...")
-# Update this path to match your folder hierarchy
-train_X, train_y = load_sisfall_data("./SisFall/SisFall_dataset")
+X_all, y_all = load_sisfall_data("./SisFall/SisFall_dataset")
 
-# 2. Load the parsed arrays into PyTorch
-dataset = SisFallDataset(train_X, train_y)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+# 2. Split the data using our custom numpy function
+X_train, X_test, y_train, y_test = manual_train_test_split(X_all, y_all, test_size=0.2, random_state=42)
 
-# 3. Initialize the 6-channel Neural Network and train!
+print(f"Training on {len(X_train)} windows, Testing on {len(X_test)} windows.")
+
+# 3. Create two separate PyTorch Loaders
+train_dataset = SisFallDataset(X_train, y_train)
+test_dataset = SisFallDataset(X_test, y_test)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# 4. Initialize and train!
 my_model = FallDetectorNN()
-train_model(my_model, dataloader, num_epochs=15)
+train_model(my_model, train_loader, test_loader, num_epochs=15)

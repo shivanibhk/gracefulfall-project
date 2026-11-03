@@ -60,6 +60,10 @@ FALL_PROBABILITY_THRESHOLD = 0.80
 REQUIRED_HIGH_PREDICTIONS = 2
 ALERT_COOLDOWN_SECONDS = 5
 
+IMPACT_THRESHOLD_G = 1.8
+FREE_FALL_THRESHOLD_G = 0.65
+QUIET_STD_THRESHOLD_G = 0.15
+ORIENTATION_CHANGE_DEGREES = 45.0
 
 window_buffer = deque(maxlen=WINDOW_SIZE)
 
@@ -124,6 +128,95 @@ async def find_nano():
 
     return None
 
+def fall_motion_signature(window):
+    """
+    Check whether the IMU window contains a plausible
+    fall-like physical pattern.
+
+    window columns:
+    ax, ay, az, gx, gy, gz
+    """
+
+    acceleration = window[:, :3]
+
+    acceleration_magnitude = np.linalg.norm(
+        acceleration,
+        axis=1,
+    )
+
+    # Look for a low-acceleration interval.
+    free_fall_detected = (
+        acceleration_magnitude.min()
+        <= FREE_FALL_THRESHOLD_G
+    )
+
+    # Look for an impact spike.
+    impact_detected = (
+        acceleration_magnitude.max()
+        >= IMPACT_THRESHOLD_G
+    )
+
+    # Check whether motion becomes quiet near the
+    # end of the window.
+    post_event_values = (
+        acceleration_magnitude[-20:]
+    )
+
+    post_event_quiet = (
+        post_event_values.std()
+        <= QUIET_STD_THRESHOLD_G
+    )
+
+    # Estimate orientation change using the
+    # average gravity direction before and after.
+    before = acceleration[:20].mean(axis=0)
+    after = acceleration[-20:].mean(axis=0)
+
+    before_norm = np.linalg.norm(before)
+    after_norm = np.linalg.norm(after)
+
+    if before_norm > 0 and after_norm > 0:
+        cosine = np.dot(before, after) / (
+            before_norm * after_norm
+        )
+
+        cosine = np.clip(cosine, -1.0, 1.0)
+
+        orientation_change = np.degrees(
+            np.arccos(cosine)
+        )
+    else:
+        orientation_change = 0.0
+
+    orientation_changed = (
+        orientation_change
+        >= ORIENTATION_CHANGE_DEGREES
+    )
+
+    # Strict condition:
+    # a free-fall-like interval followed by impact
+    strict_fall = (
+        free_fall_detected
+        and impact_detected
+    )
+
+    # More permissive condition for soft falls:
+    # impact + orientation change + reduced movement
+    soft_fall = (
+        impact_detected
+        and orientation_changed
+        and post_event_quiet
+    )
+
+    return {
+        "fall_signature": strict_fall or soft_fall,
+        "free_fall": free_fall_detected,
+        "impact": impact_detected,
+        "orientation_change": orientation_change,
+        "post_event_quiet": post_event_quiet,
+        "accel_min": acceleration_magnitude.min(),
+        "accel_max": acceleration_magnitude.max(),
+    }
 
 async def main():
     print("Loading model weights...")
@@ -209,7 +302,7 @@ async def main():
                 fall_probability = (
                     probabilities[0, 1].item()
                 )
-
+                motion = fall_motion_signature(window)
                 acceleration = window[:, :3]
                 gyroscope = window[:, 3:]
 
@@ -245,17 +338,18 @@ async def main():
                     f"P(ADL)={adl_probability:.3f} | "
                     f"P(FALL)={fall_probability:.3f} | "
                     f"rate={measured_rate:.1f} Hz | "
-                    f"a_mag mean="
-                    f"{acceleration_magnitude.mean():.3f} | "
-                    f"a_mag std="
-                    f"{acceleration_magnitude.std():.3f} | "
-                    f"gyro mean="
-                    f"{gyroscope_magnitude.mean():.3f}"
+                    f"a_min={motion['accel_min']:.3f} | "
+                    f"a_max={motion['accel_max']:.3f} | "
+                    f"orientation="
+                    f"{motion['orientation_change']:.1f}° | "
+                    f"signature="
+                    f"{motion['fall_signature']}"
                 )
 
                 if (
                     fall_probability
                     >= FALL_PROBABILITY_THRESHOLD
+                    and motion["fall_signature"]
                 ):
                     high_prediction_count += 1
                 else:

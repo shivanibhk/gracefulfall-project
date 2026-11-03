@@ -21,6 +21,7 @@ class FallDetectorNN(nn.Module):
         self.fc_layers = nn.Sequential(
             nn.Linear(32 * 25, 64), 
             nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(64, 2)
         )
 
@@ -72,14 +73,37 @@ def handle_data(sender, data):
 
 async def main():
     print("Scanning for NanoBLE...")
-    devices = await BleakScanner.discover()
-    nano = next((d for d in devices if d.name == "NanoBLE"), None)
-    
-    if not nano:
+
+    discovered = await BleakScanner.discover(
+        timeout=15,
+        return_adv=True,
+    )
+
+    nano = None
+
+    for address, result in discovered.items():
+        device, advertisement = result
+
+        device_name = device.name
+        local_name = advertisement.local_name
+
+        
+        if (
+            device_name == "NanoBLE"
+            or local_name == "NanoBLE"
+        ):
+            nano = device
+            break
+
+    if nano is None:
         print("Could not find the Arduino.")
         return
-        
-    print(f"Found {nano.name}. Connecting...")
+
+    print(
+        f"Found NanoBLE at {nano.address}. "
+        "Connecting..."
+    )
+
     async with BleakClient(nano.address) as client:
         print("Connected! Starting Pipeline C live inference...\n")
         await client.start_notify(CHAR_UUID, handle_data)

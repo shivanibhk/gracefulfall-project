@@ -12,31 +12,75 @@ def handle_data(sender, data):
     global packet_count, start_time
     if packet_count == 0:
         start_time = time.time()
-        
     packet_count += 1
-    decoded = data.decode('utf-8')
-    
+    try:
+        decoded = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        decoded = repr(data)
+
     # Calculate frequency
     elapsed = time.time() - start_time
-    freq = packet_count / elapsed if elapsed > 0 else 0
-    
-    print(f"[{elapsed:.2f}s] Received: {decoded} | Rate: {freq:.1f} Hz")
+    frequency = ( packet_count / elapsed if elapsed > 0 else 0)
+
+    print(f"[{elapsed:.2f}s] Received: {decoded} | Rate: {frequency:.1f} Hz")
+
 
 async def main():
     print("Scanning for NanoBLE...")
-    devices = await BleakScanner.discover()
-    nano = next((d for d in devices if d.name == "NanoBLE"), None)
-    
-    if not nano:
-        print("Could not find the Arduino. Make sure it is powered on and flashing.")
-        return
-        
-    print(f"Found {nano.name}. Connecting...")
-    async with BleakClient(nano.address) as client:
-        print("Connected! Listening for data for 10 seconds...\n")
-        await client.start_notify(CHAR_UUID, handle_data)
-        await asyncio.sleep(10)
-        await client.stop_notify(CHAR_UUID)
-        print(f"\nTest complete. Total packets received: {packet_count}")
 
-asyncio.run(main())
+    discovered = await BleakScanner.discover(
+        timeout=15,
+        return_adv=True,
+    )
+
+    nano = None
+
+    for address, result in discovered.items():
+        device, advertisement = result
+
+        device_name = device.name
+        local_name = advertisement.local_name
+
+        if (
+            device_name == "NanoBLE"
+            or local_name == "NanoBLE"
+        ):
+            nano = device
+            break
+
+    if nano is None:
+        print(
+            "\nNanoBLE was not found."
+            "\nCheck power, reset state, Bluetooth permissions, "
+            "and whether another device is connected."
+        )
+        return
+
+    print(
+        f"\nFound NanoBLE at {nano.address}"
+    )
+    print("Connecting...")
+
+    async with BleakClient(nano.address) as client:
+        print(
+            "Connected. Listening for data "
+            "for 10 seconds.\n"
+        )
+
+        await client.start_notify(
+            CHAR_UUID,
+            handle_data,
+        )
+
+        await asyncio.sleep(10)
+
+        await client.stop_notify(CHAR_UUID)
+
+        print(
+            f"\nTest complete. "
+            f"Packets received: {packet_count}"
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

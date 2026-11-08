@@ -27,13 +27,6 @@ def wav_to_log_mel(path):
 
     audio = audio.astype(np.float32)
 
-    peak = np.max(np.abs(audio))
-
-
-    #find peak amplitude and normalize to 1
-    if peak > 1e-6:
-        audio = audio / peak
-
     mel = librosa.feature.melspectrogram(
         y=audio,
         sr=TARGET_SAMPLE_RATE,
@@ -57,6 +50,16 @@ def wav_to_log_mel(path):
 
     return log_mel.astype(np.float32)
 
+def audio_rms(path):
+    audio, _ = librosa.load(
+        path,
+        sr=SAMPLE_RATE,
+        mono=True,
+    )
+
+    return float(
+        np.sqrt(np.mean(audio.astype(np.float64) ** 2))
+    )
 
 class AudioFallCNN(nn.Module):
     def __init__(self):

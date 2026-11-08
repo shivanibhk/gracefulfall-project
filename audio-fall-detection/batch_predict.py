@@ -2,23 +2,28 @@ import argparse
 import csv
 from pathlib import Path
 
-import torch
-
-from audio_model import AudioFallCNN, wav_to_log_mel
+from predict_audio import (
+    load_model,
+    predict_file,
+)
 
 
 def get_expected_label(path):
     """
-    Supports both:
+    Supports:
 
-    SAFE: nano-like-name-01.wav
+    SAFE: 01-020-02-073-01.wav
     Nano: nano_1_01.wav
 
     01 = fall
     02 = normal
     """
 
-    code = path.stem.replace("-", "_").split("_")[-1]
+    code = (
+        path.stem
+        .replace("-", "_")
+        .split("_")[-1]
+    )
 
     if code == "01":
         return 1
@@ -49,16 +54,7 @@ def main():
 
     args = parser.parse_args()
 
-    device = torch.device("cpu")
-
-    checkpoint = torch.load(
-        args.model,
-        map_location=device,
-    )
-
-    model = AudioFallCNN()
-    model.load_state_dict(checkpoint["model_state"])
-    model.eval()
+    model = load_model(args.model)
 
     audio_files = sorted(
         Path(args.folder).glob("*.wav")
@@ -81,67 +77,38 @@ def main():
 
         writer.writerow([
             "file",
+            "rms",
             "expected_label",
             "expected_class",
             "normal_probability",
             "fall_probability",
             "predicted_label",
             "predicted_class",
+            "quiet_audio",
             "correct",
         ])
 
         for audio_path in audio_files:
-            mel = wav_to_log_mel(
-                str(audio_path)
+            result = predict_file(
+                model,
+                str(audio_path),
             )
 
-            features = torch.tensor(
-                mel[None, None, :, :],
-                dtype=torch.float32,
+            expected_label = (
+                get_expected_label(audio_path)
             )
 
-            with torch.no_grad():
-                logits = model(features)
-                probabilities = torch.softmax(
-                    logits,
-                    dim=1,
-                )
-
-            normal_probability = (
-                probabilities[0, 0].item()
-            )
-
-            fall_probability = (
-                probabilities[0, 1].item()
-            )
-
-            predicted_label = int(
-                fall_probability >= 0.80
-            )
-
-            expected_label = get_expected_label(
-                audio_path
-            )
-
-            predicted_class = (
-                "fall"
-                if predicted_label == 1
-                else "normal"
-            )
-
-            expected_class = (
-                "unknown"
-                if expected_label is None
-                else (
-                    "fall"
-                    if expected_label == 1
-                    else "normal"
-                )
-            )
+            if expected_label is None:
+                expected_class = "unknown"
+            elif expected_label == 1:
+                expected_class = "fall"
+            else:
+                expected_class = "normal"
 
             is_correct = (
                 expected_label is not None
-                and predicted_label == expected_label
+                and result["predicted_label"]
+                == expected_label
             )
 
             if expected_label is not None:
@@ -151,19 +118,26 @@ def main():
             print(
                 f"{audio_path.name}: "
                 f"expected={expected_class}, "
-                f"predicted={predicted_class}, "
-                f"P(fall)={fall_probability:.3f}, "
+                f"predicted="
+                f"{result['predicted_class']}, "
+                f"P(fall)="
+                f"{result['fall_probability']:.3f}, "
+                f"RMS={result['rms']:.6f}, "
+                f"quiet="
+                f"{result['quiet_audio']}, "
                 f"correct={is_correct}"
             )
 
             writer.writerow([
                 audio_path.name,
+                f"{result['rms']:.6f}",
                 expected_label,
                 expected_class,
-                f"{normal_probability:.6f}",
-                f"{fall_probability:.6f}",
-                predicted_label,
-                predicted_class,
+                f"{result['normal_probability']:.6f}",
+                f"{result['fall_probability']:.6f}",
+                result["predicted_label"],
+                result["predicted_class"],
+                result["quiet_audio"],
                 is_correct,
             ])
 

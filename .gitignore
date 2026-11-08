@@ -10,3 +10,5 @@ __pycache__/
 
 .vscode/
 SisFall/
+SAFE_raw/
+nano_audio_data/

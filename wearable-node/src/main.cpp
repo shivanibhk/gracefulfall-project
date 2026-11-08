@@ -1,75 +1,123 @@
 #include <Arduino.h>
-#include <ArduinoBLE.h>
-#include <Arduino_BMI270_BMM150.h> // Correct library for Rev 2
+#include <PDM.h>
 
-BLEService sensorService("180C"); 
-// INCREASED buffer size from 30 to 100 bytes so the larger payload doesn't get cut off
-BLEStringCharacteristic dataCharacteristic("2A56", BLERead | BLENotify, 100);
+const int SAMPLE_RATE = 16000;
+const int BUFFER_SIZE = 512;
 
-// Declare variables globally to avoid reallocation
-float x, y, z;
-float gx, gy, gz; // Added for Gyroscope
+volatile int samples_ready = 0;
+volatile bool buffer_busy = false;
+
+int16_t audio_buffer[BUFFER_SIZE];
+
+void onPDMdata() {
+    int bytes_available = PDM.available();
+
+    if (bytes_available <= 0) {
+        return;
+    }
+
+    int samples_available = bytes_available / sizeof(int16_t);
+
+    if (samples_available > BUFFER_SIZE) {
+        samples_available = BUFFER_SIZE;
+    }
+
+    if (samples_ready == 0 && !buffer_busy) {
+        PDM.read(audio_buffer,
+                 samples_available * sizeof(int16_t));
+
+        samples_ready = samples_available;
+    } else {
+        // Discard this block if the host is not keeping up.
+        int16_t discard_buffer[BUFFER_SIZE];
+
+        PDM.read(
+            discard_buffer,
+            samples_available * sizeof(int16_t)
+        );
+    }
+}
 
 void setup() {
-  Serial.begin(9600);
-  if (!IMU.begin()) {
-    Serial.println("Failed to initialize IMU!");
-    while (1);
-  }
-  if (!BLE.begin()) {
-    Serial.println("starting BLE failed!");
-    while (1);
-  }
+    Serial.begin(921600);
 
-  BLE.setLocalName("NanoBLE");
-  BLE.setAdvertisedService(sensorService);
-  sensorService.addCharacteristic(dataCharacteristic);
-  BLE.addService(sensorService);
-  BLE.advertise();
+    while (!Serial && millis() < 3000) {
+        delay(10);
+    }
+
+    PDM.onReceive(onPDMdata);
+
+    if (!PDM.begin(1, SAMPLE_RATE)) {
+        Serial.println("PDM microphone initialization failed");
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    PDM.setGain(30);
+
+    Serial.println("AUDIO_READY");
 }
 
 void loop() {
-  BLEDevice central = BLE.central();
-  if (central) {
-    while (central.connected()) {
-      // Check if BOTH acceleration and gyroscope data are ready
-      if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
-        
-        IMU.readAcceleration(x, y, z);
-        IMU.readGyroscope(gx, gy, gz); 
-        
-        // Construct the new 6-channel payload
-        // Format: Timestamp, Accel_X, Accel_Y, Accel_Z, Gyro_X, Gyro_Y, Gyro_Z
-        String payload = String(millis()) + "," + 
-                         String(x, 2) + "," + String(y, 2) + "," + String(z, 2) + "," +
-                         String(gx, 2) + "," + String(gy, 2) + "," + String(gz, 2);
-                         
-        dataCharacteristic.writeValue(payload);
-        
-        // I reduced this from 20 to 15. The Arduino takes a few milliseconds to build 
-        // the string and send the Bluetooth packet. A delay of 15ms + overhead 
-        // will get you much closer to the target 50Hz (20ms total) loop speed!
-        delay(15); 
-      }
+    if (samples_ready <= 0) {
+        return;
     }
-  }
+
+    int16_t local_buffer[BUFFER_SIZE];
+    int local_count;
+
+    noInterrupts();
+
+    buffer_busy = true;
+    local_count = samples_ready;
+
+    memcpy(
+        local_buffer,
+        audio_buffer,
+        local_count * sizeof(int16_t)
+    );
+
+    samples_ready = 0;
+
+    interrupts();
+
+    /*
+       Binary frame format:
+
+       2 bytes: magic number 0xA55A
+       4 bytes: timestamp in milliseconds
+       2 bytes: number of samples
+       N bytes: signed 16-bit PCM samples
+    */
+
+    uint16_t magic = 0xA55A;
+    uint32_t timestamp = millis();
+    uint16_t count = local_count;
+
+    Serial.write(
+        reinterpret_cast<uint8_t*>(&magic),
+        sizeof(magic)
+    );
+
+    Serial.write(
+        reinterpret_cast<uint8_t*>(&timestamp),
+        sizeof(timestamp)
+    );
+
+    Serial.write(
+        reinterpret_cast<uint8_t*>(&count),
+        sizeof(count)
+    );
+
+    Serial.write(
+        reinterpret_cast<uint8_t*>(local_buffer),
+        count * sizeof(int16_t)
+    );
+
+    Serial.flush();
+
+    noInterrupts();
+    buffer_busy = false;
+    interrupts();
 }
-
-// #include <Arduino.h>
-
-// // put function declarations here:
-// int myFunction(int, int);
-
-// void setup() {
-//   // put your setup code here, to run once:
-//   int result = myFunction(2, 3);
-// }
-
-// void loop() {
-//   // put your main code here, to run repeatedly:
-// }
-
-// // put function definitions here:
-// int myFunction(int x, int y) {
-//   return x + y;
-// }

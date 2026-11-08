@@ -1,3 +1,7 @@
+#Pipeline B: IMU + audio on MAC
+#Second pipeline when PPG not available or 
+#limited compute so PPG is dropped.
+
 import argparse
 import asyncio
 import csv
@@ -19,7 +23,6 @@ from detectors.imu_detector import predict_imu
 from imu.imu_model import FallDetectorNN
 from sensors.audio_stream import AudioStream
 from sensors.imu_stream import IMUBuffer
-
 
 CHAR_UUID = (
     "00002A56-0000-1000-8000-00805f9b34fb"

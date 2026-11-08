@@ -1,3 +1,7 @@
+#Pipeline C: IMU on MAC
+#Third pipeline when only IMU is available
+#or compute is limited
+
 import asyncio
 import time
 from collections import deque

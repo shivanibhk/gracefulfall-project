@@ -1,6 +1,6 @@
 from collections import deque
 from dataclasses import dataclass
-
+import time
 import numpy as np
 
 
@@ -59,6 +59,7 @@ class IMUBuffer:
             self.buffer.append(values)
             if self.sample_logger is not None:
                 self.sample_logger({
+                    "host_timestamp": time.time(),
                     "device_timestamp_ms": timestamp,
                     "ax": values[0],
                     "ay": values[1],
@@ -90,7 +91,7 @@ class IMUBuffer:
         if first is None or last is None:
             return 0.0
 
-        elapsed_seconds = last - first / 1000.0
+        elapsed_seconds = (last - first) / 1000.0
 
         if elapsed_seconds <= 0:
             return 0.0

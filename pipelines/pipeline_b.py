@@ -10,13 +10,12 @@ from bleak import BleakClient, BleakScanner
 
 from detectors.audio_detector import (
     load_audio_model,
-    predict_audio,
+    predict_audio_samples,
 )
-from detectors.fusion_detector import (
-    fuse_predictions,
-)
+from detectors.fusion_detector import fuse_predictions
 from detectors.imu_detector import predict_imu
 from imu.imu_model import FallDetectorNN
+from sensors.audio_stream import AudioStream
 from sensors.imu_stream import IMUBuffer
 
 
@@ -29,14 +28,12 @@ INFERENCE_EVERY_N_SAMPLES = 5
 
 FALL_THRESHOLD = 0.80
 REQUIRED_HIGH_PREDICTIONS = 2
-ALERT_COOLDOWN_SECONDS = 5
+ALERT_COOLDOWN_SECONDS = 5.0
 
 
 class CSVLogger:
     def __init__(self, path, fieldnames):
-        self.path = Path(path)
-
-        self.file = self.path.open(
+        self.file = Path(path).open(
             "w",
             newline="",
         )
@@ -57,51 +54,62 @@ class CSVLogger:
 
 
 class AlertPolicy:
-    def __init__(
-        self,
-        threshold=FALL_THRESHOLD,
-        required_predictions=(
-            REQUIRED_HIGH_PREDICTIONS
-        ),
-        cooldown_seconds=(
-            ALERT_COOLDOWN_SECONDS
-        ),
-    ):
-        self.threshold = threshold
-        self.required_predictions = (
-            required_predictions
-        )
-        self.cooldown_seconds = (
-            cooldown_seconds
-        )
-
+    def __init__(self):
         self.high_prediction_count = 0
         self.last_alert_time = -float("inf")
 
-    def update(self, fall_probability):
-        if fall_probability >= self.threshold:
+    def update(self, fusion_result, imu_result):
+        motion = imu_result["motion"]
+
+        candidate = (
+            fusion_result["fall_probability"]
+            >= FALL_THRESHOLD
+            and motion["fall_signature"]
+        )
+
+        if candidate:
             self.high_prediction_count += 1
         else:
             self.high_prediction_count = 0
 
-        current_time = time.monotonic()
+        now = time.monotonic()
 
         cooldown_complete = (
-            current_time - self.last_alert_time
-            >= self.cooldown_seconds
+            now - self.last_alert_time
+            >= ALERT_COOLDOWN_SECONDS
         )
 
-        should_alert = (
+        alert = (
             self.high_prediction_count
-            >= self.required_predictions
+            >= REQUIRED_HIGH_PREDICTIONS
             and cooldown_complete
         )
 
-        if should_alert:
-            self.last_alert_time = current_time
+        if alert:
+            self.last_alert_time = now
             self.high_prediction_count = 0
 
-        return should_alert
+        return alert
+
+
+def load_imu_model(path):
+    model = FallDetectorNN()
+
+    checkpoint = torch.load(
+        path,
+        map_location="cpu",
+    )
+
+    if (
+        isinstance(checkpoint, dict)
+        and "model_state" in checkpoint
+    ):
+        checkpoint = checkpoint["model_state"]
+
+    model.load_state_dict(checkpoint)
+    model.eval()
+
+    return model
 
 
 async def find_nano():
@@ -116,10 +124,7 @@ async def find_nano():
         device, advertisement = result
 
         device_name = device.name or ""
-        local_name = (
-            advertisement.local_name
-            or ""
-        )
+        local_name = advertisement.local_name or ""
 
         if (
             device_name == "NanoBLE"
@@ -130,32 +135,11 @@ async def find_nano():
     return None
 
 
-def load_imu_model(model_path):
-    model = FallDetectorNN()
-
-    checkpoint = torch.load(
-        model_path,
-        map_location="cpu",
-    )
-
-    if (
-        isinstance(checkpoint, dict)
-        and "model_state" in checkpoint
-    ):
-        checkpoint = checkpoint[
-            "model_state"
-        ]
-
-    model.load_state_dict(checkpoint)
-    model.eval()
-
-    return model
-
-
 def create_loggers(output_prefix):
     imu_logger = CSVLogger(
         f"{output_prefix}_imu_samples.csv",
         [
+            "host_timestamp",
             "device_timestamp_ms",
             "ax",
             "ay",
@@ -174,6 +158,8 @@ def create_loggers(output_prefix):
             "inference_number",
             "imu_sample_count",
             "imu_rate_hz",
+            "audio_samples",
+            "audio_frames",
             "imu_normal_probability",
             "imu_fall_probability",
             "audio_normal_probability",
@@ -193,7 +179,7 @@ def create_loggers(output_prefix):
 
 
 async def run_pipeline(
-    audio_path,
+    port,
     duration,
     output_prefix,
 ):
@@ -209,32 +195,6 @@ async def run_pipeline(
         "audio_fall_detection/audio_model.pth"
     )
 
-    print(
-        f"Using audio file: {audio_path}"
-    )
-
-    audio_result = predict_audio(
-        audio_model,
-        audio_path,
-    )
-    # Keep audio usable for now.
-    # The current audio score participates in fusion.
-    audio_result["usable"] = True
-
-    print(
-        "Audio prediction: "
-        f"P(normal)="
-        f"{audio_result['normal_probability']:.3f} | "
-        f"P(fall)="
-        f"{audio_result['fall_probability']:.3f}"
-    )
-
-    print(
-        "NOTE: this audio score is currently "
-        "computed once from the WAV file and "
-        "reused for each IMU window."
-    )
-
     imu_logger, inference_logger = (
         create_loggers(output_prefix)
     )
@@ -244,248 +204,267 @@ async def run_pipeline(
         sample_logger=imu_logger.write,
     )
 
-    alert_policy = AlertPolicy()
-
-    nano = await find_nano()
-
-    if nano is None:
-        imu_logger.close()
-        inference_logger.close()
-
-        print("Could not find NanoBLE.")
-        return
-
-    print(
-        f"Found NanoBLE at {nano.address}."
+    audio_stream = AudioStream(
+        port=port,
+        sample_rate=16000,
+        window_seconds=3.0,
     )
 
-    async with BleakClient(nano.address) as client:
+    alert_policy = AlertPolicy()
+
+    try:
+        print("Starting live audio stream...")
+        audio_stream.start()
+
+        nano = await find_nano()
+
+        if nano is None:
+            print("Could not find NanoBLE.")
+            return
+
         print(
-            "Connected. Starting "
-            "IMU/audio fusion."
+            f"Found NanoBLE at {nano.address}."
         )
 
-        await client.start_notify(
-            CHAR_UUID,
-            imu_buffer.parse_packet,
-        )
+        async with BleakClient(
+            nano.address
+        ) as client:
+            print(
+                "Connected. Starting live "
+                "Pipeline B: IMU + audio."
+            )
 
-        session_start = time.monotonic()
-        last_inference_sample = 0
-        inference_number = 0
+            await client.start_notify(
+                CHAR_UUID,
+                imu_buffer.parse_packet,
+            )
 
-        try:
-            while True:
-                elapsed = (
+            session_start = time.monotonic()
+            last_inference_sample = 0
+            inference_number = 0
+
+            try:
+                while (
                     time.monotonic()
                     - session_start
-                )
+                    < duration
+                ):
+                    await asyncio.sleep(0.05)
 
-                if elapsed >= duration:
-                    print()
-                    print(
-                        f"Completed {duration:.2f}-second "
-                        "Pipeline B test."
+                    if not imu_buffer.ready():
+                        print(
+                            "\rWaiting for IMU: "
+                            f"{len(imu_buffer.buffer)}/"
+                            f"{WINDOW_SIZE}",
+                            end="",
+                            flush=True,
+                        )
+                        continue
+
+                    if not audio_stream.ready():
+                        stats = audio_stream.stats()
+
+                        print(
+                            "\rWaiting for audio: "
+                            f"{stats['buffer_samples']}/"
+                            f"{audio_stream.window_size}",
+                            end="",
+                            flush=True,
+                        )
+                        continue
+
+                    sample_count = (
+                        imu_buffer.stats.sample_count
                     )
-                    break
 
-                await asyncio.sleep(0.05)
+                    if (
+                        sample_count
+                        - last_inference_sample
+                        < INFERENCE_EVERY_N_SAMPLES
+                    ):
+                        continue
 
-                if not imu_buffer.ready():
+                    last_inference_sample = (
+                        sample_count
+                    )
+                    inference_number += 1
+
+                    imu_window = imu_buffer.snapshot()
+                    audio_window = audio_stream.snapshot()
+
+                    if (
+                        imu_window is None
+                        or audio_window is None
+                    ):
+                        continue
+
+                    imu_result = predict_imu(
+                        model=imu_model,
+                        window=imu_window,
+                    )
+
+                    audio_result = (
+                        predict_audio_samples(
+                            model=audio_model,
+                            samples=audio_window,
+                        )
+                    )
+
+                    # Keep audio active for this
+                    # experiment.
+                    audio_result["usable"] = True
+
+                    fusion_result = fuse_predictions(
+                        imu_result=imu_result,
+                        audio_result=audio_result,
+                    )
+
+                    alert = alert_policy.update(
+                        fusion_result=fusion_result,
+                        imu_result=imu_result,
+                    )
+
+                    motion = imu_result["motion"]
+                    audio_stats = audio_stream.stats()
+
                     print(
-                        "\rCollecting IMU samples: "
-                        f"{len(imu_buffer.buffer)}/"
-                        f"{WINDOW_SIZE}",
+                        f"\rInference "
+                        f"{inference_number:04d} | "
+                        f"P(IMU)="
+                        f"{imu_result['fall_probability']:.3f} | "
+                        f"P(audio)="
+                        f"{audio_result['fall_probability']:.3f} | "
+                        f"P(fused)="
+                        f"{fusion_result['fall_probability']:.3f} | "
+                        f"rate="
+                        f"{imu_buffer.measured_rate_hz():.1f} Hz | "
+                        f"impact={motion['impact']}",
                         end="",
                         flush=True,
                     )
-                    continue
 
-                current_sample_count = (
-                    imu_buffer.stats.sample_count
+                    inference_logger.write({
+                        "host_timestamp": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "pipeline": "B_imu_audio_mac",
+                        "inference_number": (
+                            inference_number
+                        ),
+                        "imu_sample_count": (
+                            sample_count
+                        ),
+                        "imu_rate_hz": (
+                            imu_buffer.measured_rate_hz()
+                        ),
+                        "audio_samples": (
+                            audio_stats[
+                                "samples_received"
+                            ]
+                        ),
+                        "audio_frames": (
+                            audio_stats[
+                                "frames_received"
+                            ]
+                        ),
+                        "imu_normal_probability": (
+                            imu_result[
+                                "normal_probability"
+                            ]
+                        ),
+                        "imu_fall_probability": (
+                            imu_result[
+                                "fall_probability"
+                            ]
+                        ),
+                        "audio_normal_probability": (
+                            audio_result[
+                                "normal_probability"
+                            ]
+                        ),
+                        "audio_fall_probability": (
+                            audio_result[
+                                "fall_probability"
+                            ]
+                        ),
+                        "fused_fall_probability": (
+                            fusion_result[
+                                "fall_probability"
+                            ]
+                        ),
+                        "free_fall": (
+                            motion["free_fall"]
+                        ),
+                        "impact": (
+                            motion["impact"]
+                        ),
+                        "orientation_change": (
+                            motion[
+                                "orientation_change"
+                            ]
+                        ),
+                        "post_event_quiet": (
+                            motion[
+                                "post_event_quiet"
+                            ]
+                        ),
+                        "fall_signature": (
+                            motion[
+                                "fall_signature"
+                            ]
+                        ),
+                        "decision": (
+                            fusion_result[
+                                "decision"
+                            ]
+                        ),
+                        "alert": alert,
+                    })
+
+                    if alert:
+                        print(
+                            "\n\n*** FALL DETECTED "
+                            "BY PIPELINE B ***\n"
+                        )
+
+            finally:
+                await client.stop_notify(
+                    CHAR_UUID
                 )
 
-                if (
-                    current_sample_count
-                    - last_inference_sample
-                    < INFERENCE_EVERY_N_SAMPLES
-                ):
-                    continue
-
-                last_inference_sample = (
-                    current_sample_count
-                )
-
-                inference_number += 1
-
-                window = imu_buffer.snapshot()
-
-                if window is None:
-                    continue
-
-                imu_result = predict_imu(
-                    model=imu_model,
-                    window=window,
-                )
-
-                fusion_result = fuse_predictions(
-                    imu_result=imu_result,
-                    audio_result=audio_result,
-                )
-
-                alert = alert_policy.update(
-                    fusion_result[
-                        "fall_probability"
-                    ]
-                )
-
-                motion = imu_result["motion"]
-
-                print(
-                    f"\rInference "
-                    f"{inference_number:04d} | "
-                    f"P(IMU fall)="
-                    f"{imu_result['fall_probability']:.3f} | "
-                    f"P(audio fall)="
-                    f"{audio_result['fall_probability']:.3f} | "
-                    f"P(combined fall)="
-                    f"{fusion_result['fall_probability']:.3f} | "
-                    f"impact="
-                    f"{motion['impact']}",
-                    end="",
-                    flush=True,
-                )
-
-                inference_logger.write({
-                    "host_timestamp": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
-
-                    "pipeline": "B_imu_audio_mac",
-
-                    "inference_number": (
-                        inference_number
-                    ),
-
-                    "imu_sample_count": (
-                        imu_buffer.stats.sample_count
-                    ),
-
-                    "imu_rate_hz": (
-                        imu_buffer.measured_rate_hz()
-                    ),
-
-                    "imu_normal_probability": (
-                        imu_result[
-                            "normal_probability"
-                        ]
-                    ),
-
-                    "imu_fall_probability": (
-                        imu_result[
-                            "fall_probability"
-                        ]
-                    ),
-
-                    "audio_normal_probability": (
-                        audio_result[
-                            "normal_probability"
-                        ]
-                    ),
-
-                    "audio_fall_probability": (
-                        audio_result[
-                            "fall_probability"
-                        ]
-                    ),
-
-                    "fused_fall_probability": (
-                        fusion_result[
-                            "fall_probability"
-                        ]
-                    ),
-
-                    "free_fall": (
-                        motion["free_fall"]
-                    ),
-
-                    "impact": (
-                        motion["impact"]
-                    ),
-
-                    "orientation_change": (
-                        motion[
-                            "orientation_change"
-                        ]
-                    ),
-
-                    "post_event_quiet": (
-                        motion[
-                            "post_event_quiet"
-                        ]
-                    ),
-
-                    "fall_signature": (
-                        motion[
-                            "fall_signature"
-                        ]
-                    ),
-
-                    "decision": (
-                        fusion_result[
-                            "decision"
-                        ]
-                    ),
-
-                    "alert": alert,
-                })
-
-                if alert:
-                    print()
-                    print(
-                        "\n*** FALL DETECTED "
-                        "BY PIPELINE B ***\n"
-                    )
-
-        finally:
-            await client.stop_notify(
-                CHAR_UUID
-            )
-
-            imu_logger.close()
-            inference_logger.close()
+    finally:
+        audio_stream.stop()
+        imu_logger.close()
+        inference_logger.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--audio",
+        "--port",
         required=True,
-        help="Audio WAV file",
+        help="Nano USB serial port for audio",
     )
 
     parser.add_argument(
         "--duration",
         type=float,
-        default=5.0,
-        help=(
-            "How long Pipeline B should run "
-            "after BLE connection"
-        ),
+        default=30.0,
+        help="Pipeline runtime in seconds",
     )
 
     parser.add_argument(
         "--output-prefix",
-        default="pipeline_b_test",
-        help="Prefix for CSV files",
+        default="pipeline_b_live",
+        help="CSV output prefix",
     )
 
     args = parser.parse_args()
 
     asyncio.run(
         run_pipeline(
-            audio_path=args.audio,
+            port=args.port,
             duration=args.duration,
             output_prefix=args.output_prefix,
         )

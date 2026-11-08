@@ -225,7 +225,7 @@ async def main():
 
     model.load_state_dict(
         torch.load(
-            "sisfall_heavy_model.pth",
+            "imu/sisfall_heavy_model.pth",
             map_location="cpu",
         )
     )

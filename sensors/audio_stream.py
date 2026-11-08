@@ -6,7 +6,6 @@ from collections import deque
 import numpy as np
 import serial
 
-
 MAGIC = 0xA55A
 HEADER_FORMAT = "<HIH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -27,13 +26,17 @@ class AudioStream:
         port,
         sample_rate=16000,
         window_seconds=3.0,
+        frame_filter=None,
+        frame_delay=None,
     ):
         self.port = port
         self.sample_rate = sample_rate
-
         self.window_size = int(
             sample_rate * window_seconds
         )
+
+        self.frame_filter = frame_filter
+        self.frame_delay = frame_delay
 
         self.buffer = deque(
             maxlen=self.window_size
@@ -41,15 +44,17 @@ class AudioStream:
 
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
-
         self.connection = None
         self.thread = None
 
         self.frames_received = 0
         self.samples_received = 0
+        self.dropped_frames = 0
         self.invalid_frames = 0
         self.last_device_timestamp = None
         self.error = None
+
+        self.frame_number = 0
 
     def open(self):
         self.connection = serial.Serial(
@@ -148,21 +153,14 @@ class AudioStream:
     def stats(self):
         with self.lock:
             return {
-                "frames_received": (
-                    self.frames_received
-                ),
-                "samples_received": (
-                    self.samples_received
-                ),
-                "invalid_frames": (
-                    self.invalid_frames
-                ),
+                "frames_received": self.frames_received,
+                "samples_received": self.samples_received,
+                "dropped_frames": self.dropped_frames,
+                "invalid_frames": self.invalid_frames,
                 "last_device_timestamp": (
                     self.last_device_timestamp
                 ),
-                "buffer_samples": len(
-                    self.buffer
-                ),
+                "buffer_samples": len(self.buffer),
                 "error": self.error,
             }
 
@@ -176,22 +174,34 @@ class AudioStream:
 
                 timestamp, samples = frame
 
+                self.frame_number += 1
+
+                if self.frame_delay is not None:
+                    self.frame_delay()
+
+                if (
+                    self.frame_filter is not None
+                    and not self.frame_filter(
+                        self.frame_number
+                    )
+                ):
+                    with self.lock:
+                        self.dropped_frames += 1
+
+                    continue
+
                 with self.lock:
                     self.buffer.extend(
                         samples.tolist()
                     )
 
                     self.frames_received += 1
-                    self.samples_received += (
-                        len(samples)
-                    )
-
-                    self.last_device_timestamp = (
-                        timestamp
-                    )
+                    self.samples_received += len(samples)
+                    self.last_device_timestamp = timestamp
 
         except Exception as error:
-            self.error = repr(error)
+            with self.lock:
+                self.error = repr(error)
 
     def _read_frame(self):
         magic_bytes = struct.pack(

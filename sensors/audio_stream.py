@@ -15,8 +15,11 @@ MAX_FRAME_SAMPLES = 512
 
 class AudioStream:
     """
-    Reads binary microphone frames from the Nano over USB
-    and maintains a rolling three-second audio window.
+    Reads binary microphone frames from the Nano
+    over USB Serial.
+
+    The stream does not begin until start_streaming()
+    sends START to the Nano.
     """
 
     def __init__(
@@ -48,18 +51,47 @@ class AudioStream:
         self.last_device_timestamp = None
         self.error = None
 
-    def start(self):
+    def open(self):
         self.connection = serial.Serial(
             port=self.port,
             baudrate=921600,
             timeout=0.1,
         )
 
-        # Opening the port may reset the Nano.
+        # Opening USB serial may reset the Nano.
         time.sleep(1.0)
 
-        # Discard startup text and partial frames.
+        # Remove startup text and incomplete data.
         self.connection.reset_input_buffer()
+
+    def start_streaming(self):
+        if self.connection is None:
+            raise RuntimeError(
+                "Call open() before start_streaming()"
+            )
+
+        self.connection.write(
+            b"START\n"
+        )
+
+        deadline = (
+            time.monotonic() + 2.0
+        )
+
+        while time.monotonic() < deadline:
+            line = self.connection.readline()
+
+            if b"STREAM_STARTED" in line:
+                break
+
+        else:
+            raise RuntimeError(
+                "Nano did not acknowledge START"
+            )
+
+        self.reset_session()
+
+        self.stop_event.clear()
 
         self.thread = threading.Thread(
             target=self._read_loop,
@@ -68,18 +100,40 @@ class AudioStream:
 
         self.thread.start()
 
+    def reset_session(self):
+        with self.lock:
+            self.buffer.clear()
+
+            self.frames_received = 0
+            self.samples_received = 0
+            self.invalid_frames = 0
+            self.last_device_timestamp = None
+            self.error = None
+
     def stop(self):
         self.stop_event.set()
 
         if self.connection is not None:
+            try:
+                self.connection.write(
+                    b"STOP\n"
+                )
+            except Exception:
+                pass
+
             self.connection.close()
 
         if self.thread is not None:
-            self.thread.join(timeout=2.0)
+            self.thread.join(
+                timeout=2.0
+            )
 
     def ready(self):
         with self.lock:
-            return len(self.buffer) >= self.window_size
+            return (
+                len(self.buffer)
+                >= self.window_size
+            )
 
     def snapshot(self):
         with self.lock:
@@ -94,13 +148,21 @@ class AudioStream:
     def stats(self):
         with self.lock:
             return {
-                "frames_received": self.frames_received,
-                "samples_received": self.samples_received,
-                "invalid_frames": self.invalid_frames,
+                "frames_received": (
+                    self.frames_received
+                ),
+                "samples_received": (
+                    self.samples_received
+                ),
+                "invalid_frames": (
+                    self.invalid_frames
+                ),
                 "last_device_timestamp": (
                     self.last_device_timestamp
                 ),
-                "buffer_samples": len(self.buffer),
+                "buffer_samples": len(
+                    self.buffer
+                ),
                 "error": self.error,
             }
 
@@ -120,7 +182,10 @@ class AudioStream:
                     )
 
                     self.frames_received += 1
-                    self.samples_received += len(samples)
+                    self.samples_received += (
+                        len(samples)
+                    )
+
                     self.last_device_timestamp = (
                         timestamp
                     )
@@ -160,7 +225,11 @@ class AudioStream:
                 header_rest,
             )
 
-            if not 0 < sample_count <= MAX_FRAME_SAMPLES:
+            if not (
+                0
+                < sample_count
+                <= MAX_FRAME_SAMPLES
+            ):
                 with self.lock:
                     self.invalid_frames += 1
 

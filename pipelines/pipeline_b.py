@@ -12,7 +12,9 @@ from detectors.audio_detector import (
     load_audio_model,
     predict_audio_samples,
 )
-from detectors.fusion_detector import fuse_predictions
+from detectors.fusion_detector import (
+    fuse_predictions,
+)
 from detectors.imu_detector import predict_imu
 from imu.imu_model import FallDetectorNN
 from sensors.audio_stream import AudioStream
@@ -23,11 +25,30 @@ CHAR_UUID = (
     "00002A56-0000-1000-8000-00805f9b34fb"
 )
 
-WINDOW_SIZE = 100
-INFERENCE_EVERY_N_SAMPLES = 5
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_WINDOW_SECONDS = 3.0
+AUDIO_WINDOW_SAMPLES = int(
+    AUDIO_SAMPLE_RATE
+    * AUDIO_WINDOW_SECONDS
+)
+
+IMU_TARGET_RATE = 50
+IMU_WINDOW_SECONDS = 3.0
+IMU_WINDOW_SAMPLES = int(
+    IMU_TARGET_RATE
+    * IMU_WINDOW_SECONDS
+)
+
+# The current SisFall model expects:
+# 100 samples x 6 channels
+IMU_MODEL_SAMPLES = 100
+
+# Process one new multimodal window
+# every approximately three seconds.
+WINDOW_STRIDE_SAMPLES = IMU_WINDOW_SAMPLES
 
 FALL_THRESHOLD = 0.80
-REQUIRED_HIGH_PREDICTIONS = 2
+REQUIRED_HIGH_PREDICTIONS = 1
 ALERT_COOLDOWN_SECONDS = 5.0
 
 
@@ -104,7 +125,9 @@ def load_imu_model(path):
         isinstance(checkpoint, dict)
         and "model_state" in checkpoint
     ):
-        checkpoint = checkpoint["model_state"]
+        checkpoint = checkpoint[
+            "model_state"
+        ]
 
     model.load_state_dict(checkpoint)
     model.eval()
@@ -124,7 +147,10 @@ async def find_nano():
         device, advertisement = result
 
         device_name = device.name or ""
-        local_name = advertisement.local_name or ""
+        local_name = (
+            advertisement.local_name
+            or ""
+        )
 
         if (
             device_name == "NanoBLE"
@@ -155,11 +181,12 @@ def create_loggers(output_prefix):
         [
             "host_timestamp",
             "pipeline",
-            "inference_number",
+            "window_number",
             "imu_sample_count",
             "imu_rate_hz",
             "audio_samples",
             "audio_frames",
+            "audio_rate_hz",
             "imu_normal_probability",
             "imu_fall_probability",
             "audio_normal_probability",
@@ -176,6 +203,18 @@ def create_loggers(output_prefix):
     )
 
     return imu_logger, inference_logger
+
+
+def write_imu_sample(
+    logger,
+    row,
+):
+    logger.write({
+        "host_timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        **row,
+    })
 
 
 async def run_pipeline(
@@ -200,21 +239,29 @@ async def run_pipeline(
     )
 
     imu_buffer = IMUBuffer(
-        window_size=WINDOW_SIZE,
-        sample_logger=imu_logger.write,
+        window_size=IMU_WINDOW_SAMPLES,
+        sample_logger=lambda row: (
+            write_imu_sample(
+                imu_logger,
+                row,
+            )
+        ),
     )
 
     audio_stream = AudioStream(
         port=port,
-        sample_rate=16000,
-        window_seconds=3.0,
+        sample_rate=AUDIO_SAMPLE_RATE,
+        window_seconds=AUDIO_WINDOW_SECONDS,
     )
 
     alert_policy = AlertPolicy()
 
     try:
-        print("Starting live audio stream...")
-        audio_stream.start()
+        print("Opening USB audio connection...")
+
+        # Opens the port but does not send
+        # sensor data yet.
+        audio_stream.open()
 
         nano = await find_nano()
 
@@ -230,8 +277,7 @@ async def run_pipeline(
             nano.address
         ) as client:
             print(
-                "Connected. Starting live "
-                "Pipeline B: IMU + audio."
+                "Connected to NanoBLE."
             )
 
             await client.start_notify(
@@ -239,9 +285,23 @@ async def run_pipeline(
                 imu_buffer.parse_packet,
             )
 
+            print(
+                "Starting IMU and audio "
+                "streams together..."
+            )
+
+            # This sends START to the Nano.
+            # The Nano then begins both IMU
+            # and audio transmission.
+            audio_stream.start_streaming()
+
+            print(
+                "IMU and audio streaming started."
+            )
+
             session_start = time.monotonic()
-            last_inference_sample = 0
-            inference_number = 0
+            last_window_sample = 0
+            window_number = 0
 
             try:
                 while (
@@ -251,72 +311,89 @@ async def run_pipeline(
                 ):
                     await asyncio.sleep(0.05)
 
+                    audio_stats = (
+                        audio_stream.stats()
+                    )
+
                     if not imu_buffer.ready():
                         print(
                             "\rWaiting for IMU: "
                             f"{len(imu_buffer.buffer)}/"
-                            f"{WINDOW_SIZE}",
+                            f"{IMU_WINDOW_SAMPLES}",
                             end="",
                             flush=True,
                         )
                         continue
 
                     if not audio_stream.ready():
-                        stats = audio_stream.stats()
-
                         print(
                             "\rWaiting for audio: "
-                            f"{stats['buffer_samples']}/"
-                            f"{audio_stream.window_size}",
+                            f"{audio_stats['buffer_samples']}/"
+                            f"{AUDIO_WINDOW_SAMPLES}",
                             end="",
                             flush=True,
                         )
                         continue
 
-                    sample_count = (
+                    current_imu_count = (
                         imu_buffer.stats.sample_count
                     )
 
                     if (
-                        sample_count
-                        - last_inference_sample
-                        < INFERENCE_EVERY_N_SAMPLES
+                        current_imu_count
+                        - last_window_sample
+                        < WINDOW_STRIDE_SAMPLES
                     ):
                         continue
 
-                    last_inference_sample = (
-                        sample_count
+                    last_window_sample = (
+                        current_imu_count
                     )
-                    inference_number += 1
+                    window_number += 1
 
-                    imu_window = imu_buffer.snapshot()
-                    audio_window = audio_stream.snapshot()
+                    imu_window_3s = (
+                        imu_buffer.snapshot()
+                    )
+
+                    audio_window_3s = (
+                        audio_stream.snapshot()
+                    )
 
                     if (
-                        imu_window is None
-                        or audio_window is None
+                        imu_window_3s is None
+                        or audio_window_3s is None
                     ):
                         continue
+
+                    # The current SisFall model accepts
+                    # 100 samples, approximately two
+                    # seconds at 50 Hz.
+                    imu_window_2s = (
+                        imu_window_3s[
+                            -IMU_MODEL_SAMPLES:
+                        ]
+                    )
 
                     imu_result = predict_imu(
                         model=imu_model,
-                        window=imu_window,
+                        window=imu_window_2s,
                     )
 
                     audio_result = (
                         predict_audio_samples(
                             model=audio_model,
-                            samples=audio_window,
+                            samples=audio_window_3s,
                         )
                     )
 
-                    # Keep audio active for this
-                    # experiment.
+                    # Keep audio active.
                     audio_result["usable"] = True
 
-                    fusion_result = fuse_predictions(
-                        imu_result=imu_result,
-                        audio_result=audio_result,
+                    fusion_result = (
+                        fuse_predictions(
+                            imu_result=imu_result,
+                            audio_result=audio_result,
+                        )
                     )
 
                     alert = alert_policy.update(
@@ -325,20 +402,30 @@ async def run_pipeline(
                     )
 
                     motion = imu_result["motion"]
-                    audio_stats = audio_stream.stats()
+
+                    elapsed = (
+                        time.monotonic()
+                        - session_start
+                    )
+
+                    if elapsed > 0:
+                        audio_rate = (
+                            audio_stats[
+                                "samples_received"
+                            ]
+                            / elapsed
+                        )
+                    else:
+                        audio_rate = 0.0
 
                     print(
-                        f"\rInference "
-                        f"{inference_number:04d} | "
-                        f"P(IMU)="
-                        f"{imu_result['fall_probability']:.3f} | "
-                        f"P(audio)="
-                        f"{audio_result['fall_probability']:.3f} | "
-                        f"P(fused)="
-                        f"{fusion_result['fall_probability']:.3f} | "
-                        f"rate="
-                        f"{imu_buffer.measured_rate_hz():.1f} Hz | "
-                        f"impact={motion['impact']}",
+                        f"\rWindow {window_number:04d} | "
+                        f"P(IMU)= {imu_result['fall_probability']:.3f} | "
+                        f"P(audio)= {audio_result['fall_probability']:.3f} | "
+                        f"P(fused)= {fusion_result['fall_probability']:.3f} | "
+                        f"IMU rate= {imu_buffer.measured_rate_hz():.1f} Hz | "
+                        f"audio rate= {audio_rate:.0f} Hz | "
+                        f"impact= {motion['impact']}",
                         end="",
                         flush=True,
                     )
@@ -347,77 +434,99 @@ async def run_pipeline(
                         "host_timestamp": datetime.now(
                             timezone.utc
                         ).isoformat(),
-                        "pipeline": "B_imu_audio_mac",
-                        "inference_number": (
-                            inference_number
+
+                        "pipeline": (
+                            "B_imu_audio_mac"
                         ),
+
+                        "window_number": (
+                            window_number
+                        ),
+
                         "imu_sample_count": (
-                            sample_count
+                            current_imu_count
                         ),
+
                         "imu_rate_hz": (
                             imu_buffer.measured_rate_hz()
                         ),
+
                         "audio_samples": (
                             audio_stats[
                                 "samples_received"
                             ]
                         ),
+
                         "audio_frames": (
                             audio_stats[
                                 "frames_received"
                             ]
                         ),
+
+                        "audio_rate_hz": audio_rate,
+
                         "imu_normal_probability": (
                             imu_result[
                                 "normal_probability"
                             ]
                         ),
+
                         "imu_fall_probability": (
                             imu_result[
                                 "fall_probability"
                             ]
                         ),
+
                         "audio_normal_probability": (
                             audio_result[
                                 "normal_probability"
                             ]
                         ),
+
                         "audio_fall_probability": (
                             audio_result[
                                 "fall_probability"
                             ]
                         ),
+
                         "fused_fall_probability": (
                             fusion_result[
                                 "fall_probability"
                             ]
                         ),
+
                         "free_fall": (
                             motion["free_fall"]
                         ),
+
                         "impact": (
                             motion["impact"]
                         ),
+
                         "orientation_change": (
                             motion[
                                 "orientation_change"
                             ]
                         ),
+
                         "post_event_quiet": (
                             motion[
                                 "post_event_quiet"
                             ]
                         ),
+
                         "fall_signature": (
                             motion[
                                 "fall_signature"
                             ]
                         ),
+
                         "decision": (
                             fusion_result[
                                 "decision"
                             ]
                         ),
+
                         "alert": alert,
                     })
 
@@ -444,20 +553,19 @@ def main():
     parser.add_argument(
         "--port",
         required=True,
-        help="Nano USB serial port for audio",
+        help="Nano USB serial port",
     )
 
     parser.add_argument(
         "--duration",
         type=float,
         default=30.0,
-        help="Pipeline runtime in seconds",
+        help="Runtime in seconds",
     )
 
     parser.add_argument(
         "--output-prefix",
         default="pipeline_b_live",
-        help="CSV output prefix",
     )
 
     args = parser.parse_args()

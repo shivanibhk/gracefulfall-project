@@ -8,24 +8,27 @@ TARGET_SAMPLE_RATE = 16000
 CLIP_SECONDS = 3.0
 CLIP_SAMPLES = int(TARGET_SAMPLE_RATE * CLIP_SECONDS)
 
-#convert wav file to log-mel spectogram
-def wav_to_log_mel(path):
-    audio, _ = librosa.load(
-        path,
-        sr=TARGET_SAMPLE_RATE,
-        mono=True,
+def audio_to_log_mel(audio):
+    """
+    Convert one raw audio window to normalized
+    log-mel features.
+    """
+
+    audio = np.asarray(
+        audio,
+        dtype=np.float32,
     )
 
-    #pad audio with silence at end if not long enough
     if len(audio) < CLIP_SAMPLES:
         audio = np.pad(
             audio,
-            (0, CLIP_SAMPLES - len(audio)),
+            (
+                0,
+                CLIP_SAMPLES - len(audio),
+            ),
         )
-    else: #if longer, only use first 3 seconds
+    else:
         audio = audio[:CLIP_SAMPLES]
-
-    audio = audio.astype(np.float32)
 
     mel = librosa.feature.melspectrogram(
         y=audio,
@@ -50,10 +53,20 @@ def wav_to_log_mel(path):
 
     return log_mel.astype(np.float32)
 
+
+def wav_to_log_mel(path):
+    audio, _ = librosa.load(
+        path,
+        sr=TARGET_SAMPLE_RATE,
+        mono=True,
+    )
+
+    return audio_to_log_mel(audio)
+
 def audio_rms(path):
     audio, _ = librosa.load(
         path,
-        sr=SAMPLE_RATE,
+        sr=TARGET_SAMPLE_RATE,
         mono=True,
     )
 

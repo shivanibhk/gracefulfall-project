@@ -2,11 +2,9 @@
 #include <ArduinoBLE.h>
 #include <Arduino_BMI270_BMM150.h>
 #include <PDM.h>
+#include <cstring>
 
-// ============================================================
 // BLE IMU configuration
-// ============================================================
-
 BLEService sensorService("180C");
 
 BLEStringCharacteristic dataCharacteristic(
@@ -24,27 +22,38 @@ float gy;
 float gz;
 
 unsigned long last_imu_send_time = 0;
+
 const unsigned long IMU_INTERVAL_MS = 20;
 
 
-// ============================================================
 // Audio configuration
-// ============================================================
-
 const int SAMPLE_RATE = 16000;
 const int BUFFER_SIZE = 512;
 
-volatile int samples_ready = 0;
-volatile bool buffer_busy = false;
+const int AUDIO_BLOCK_COUNT = 4;
 
-int16_t audio_buffer[BUFFER_SIZE];
+int16_t audio_blocks[
+    AUDIO_BLOCK_COUNT
+][BUFFER_SIZE];
+
+uint16_t audio_block_counts[
+    AUDIO_BLOCK_COUNT
+];
+
 int16_t discard_buffer[BUFFER_SIZE];
 
+volatile uint8_t audio_write_index = 0;
+volatile uint8_t audio_read_index = 0;
+volatile uint8_t audio_ready_blocks = 0;
 
-// ============================================================
+volatile uint32_t dropped_audio_blocks = 0;
+
+
+// Streaming control
+volatile bool streaming_enabled = false;
+
+
 // Microphone interrupt callback
-// ============================================================
-
 void onPDMdata() {
     int bytes_available = PDM.available();
 
@@ -55,37 +64,145 @@ void onPDMdata() {
     int samples_available =
         bytes_available / sizeof(int16_t);
 
-    if (samples_available > BUFFER_SIZE) {
+    if (
+        samples_available
+        > BUFFER_SIZE
+    ) {
         samples_available = BUFFER_SIZE;
     }
 
-    if (
-        samples_ready == 0
-        && !buffer_busy
-    ) {
-        PDM.read(
-            audio_buffer,
-            samples_available * sizeof(int16_t)
-        );
-
-        samples_ready = samples_available;
-    } else {
-        // The host is not keeping up.
-        // Read and discard the block.
+    /*
+       Before START, consume and discard microphone data
+       so the PDM buffer does not overflow.
+    */
+    if (!streaming_enabled) {
         PDM.read(
             discard_buffer,
             samples_available * sizeof(int16_t)
         );
+
+        return;
+    }
+
+    /*
+       Store the block if the ring buffer has space.
+    */
+    if (
+        audio_ready_blocks
+        < AUDIO_BLOCK_COUNT
+    ) {
+        PDM.read(
+            audio_blocks[audio_write_index],
+            samples_available * sizeof(int16_t)
+        );
+
+        audio_block_counts[
+            audio_write_index
+        ] = samples_available;
+
+        audio_write_index =
+            (
+                audio_write_index + 1
+            )
+            % AUDIO_BLOCK_COUNT;
+
+        audio_ready_blocks++;
+    }
+
+    /*
+       If all blocks are full, discard this block.
+    */
+    else {
+        PDM.read(
+            discard_buffer,
+            samples_available * sizeof(int16_t)
+        );
+
+        dropped_audio_blocks++;
     }
 }
 
 
-// ============================================================
-// Send one audio frame over USB Serial
-// ============================================================
+// Process commands sent from Python over USB
+void process_host_commands() {
+    static char command_buffer[32];
+    static int command_length = 0;
 
+    while (Serial.available() > 0) {
+        char character = Serial.read();
+
+        if (
+            character == '\n'
+            || character == '\r'
+        ) {
+            if (command_length == 0) {
+                continue;
+            }
+
+            command_buffer[
+                command_length
+            ] = '\0';
+
+            if (
+                strcmp(
+                    command_buffer,
+                    "START"
+                ) == 0
+            ) {
+                noInterrupts();
+
+                audio_write_index = 0;
+                audio_read_index = 0;
+                audio_ready_blocks = 0;
+                dropped_audio_blocks = 0;
+
+                streaming_enabled = true;
+
+                interrupts();
+
+                Serial.println(
+                    "STREAM_STARTED"
+                );
+            }
+
+            else if (
+                strcmp(
+                    command_buffer,
+                    "STOP"
+                ) == 0
+            ) {
+                noInterrupts();
+
+                streaming_enabled = false;
+                audio_ready_blocks = 0;
+
+                interrupts();
+
+                Serial.println(
+                    "STREAM_STOPPED"
+                );
+            }
+
+            command_length = 0;
+        }
+
+        else if (
+            command_length
+            < sizeof(command_buffer) - 1
+        ) {
+            command_buffer[
+                command_length
+            ] = character;
+
+            command_length++;
+        }
+    }
+}
+
+
+// Send one binary audio frame over USB Serial
 void send_audio_frame() {
-    if (samples_ready <= 0) {
+    if (!streaming_enabled) {
         return;
     }
 
@@ -94,17 +211,27 @@ void send_audio_frame() {
 
     noInterrupts();
 
-    buffer_busy = true;
+    if (audio_ready_blocks == 0) {
+        interrupts();
+        return;
+    }
 
-    local_count = samples_ready;
+    local_count =
+        audio_block_counts[audio_read_index];
 
     memcpy(
         local_buffer,
-        audio_buffer,
+        audio_blocks[audio_read_index],
         local_count * sizeof(int16_t)
     );
 
-    samples_ready = 0;
+    audio_read_index =
+        (
+            audio_read_index + 1
+        )
+        % AUDIO_BLOCK_COUNT;
+
+    audio_ready_blocks--;
 
     interrupts();
 
@@ -140,22 +267,15 @@ void send_audio_frame() {
         reinterpret_cast<uint8_t*>(local_buffer),
         count * sizeof(int16_t)
     );
-
-    Serial.flush();
-
-    noInterrupts();
-
-    buffer_busy = false;
-
-    interrupts();
 }
 
 
-// ============================================================
-// Send one IMU packet over BLE
-// ============================================================
-
+// Send one IMU sample over BLE
 void send_imu_sample() {
+    if (!streaming_enabled) {
+        return;
+    }
+
     if (
         !IMU.accelerationAvailable()
         || !IMU.gyroscopeAvailable()
@@ -186,20 +306,21 @@ void send_imu_sample() {
         gz
     );
 
-    /*
-       BLE format:
+    // BLE packet format: timestamp,ax,ay,az,gx,gy,gz
+    char payload[100];
 
-       timestamp,ax,ay,az,gx,gy,gz
-    */
-
-    String payload =
-        String(now) + ","
-        + String(x, 2) + ","
-        + String(y, 2) + ","
-        + String(z, 2) + ","
-        + String(gx, 2) + ","
-        + String(gy, 2) + ","
-        + String(gz, 2);
+    snprintf(
+        payload,
+        sizeof(payload),
+        "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
+        now,
+        x,
+        y,
+        z,
+        gx,
+        gy,
+        gz
+    );
 
     dataCharacteristic.writeValue(
         payload
@@ -207,14 +328,9 @@ void send_imu_sample() {
 }
 
 
-// ============================================================
 // Setup
-// ============================================================
-
 void setup() {
-    /*
-       The audio Python script expects 921600 baud rate.
-    */
+    // The Python audio receiver expects 921600 baud.
     Serial.begin(921600);
 
     while (
@@ -280,35 +396,23 @@ void setup() {
         }
     }
 
-    /*
-       Use 10 instead of 30 initially.
-    */
     PDM.setGain(10);
 
-    Serial.println(
-        "IMU_READY"
-    );
+    streaming_enabled = false;
 
-    Serial.println(
-        "AUDIO_READY"
-    );
+    Serial.println("IMU_READY");
+    Serial.println("AUDIO_READY");
+    Serial.println("WAITING_FOR_START");
 }
 
 
-// ============================================================
-// Main loop
-// ============================================================
 
+// Main loop
 void loop() {
-    /*
-       Keep BLE processing active.
-    */
     BLE.poll();
 
-    /*
-       If a BLE central is connected, send IMU data.
-       Audio is sent regardless of BLE connection.
-    */
+    process_host_commands();
+
     send_imu_sample();
 
     send_audio_frame();
